@@ -1,6 +1,6 @@
 {
   "name": "@kirigaya/openclaw-onebot",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "OneBot v11 protocol channel plugin for OpenClaw (QQ/Lagrange.Core/go-cqhttp)",
   "license": "MIT",
   "publishConfig": {
@@ -30,8 +30,10 @@
     "dist",
     "themes",
     "skills",
+    "figure",
     "openclaw.plugin.json",
-    "README.md"
+    "README.md",
+    "CHANGELOG.md"
   ],
   "openclaw": {
     "extensions": [
@@ -39,7 +41,7 @@
     ],
     "skills": [
       "skills/onebot-ops",
-      "skills/onebot-scripts"
+      "skills/onebot-messaging"
     ],
     "channel": {
       "id": "onebot",
@@ -52,7 +54,36 @@
         "qq",
         "lagrange",
         "cqhttp"
+      ],
+      "cliAddOptions": [
+        {
+          "flags": "--type <type>",
+          "description": "连接类型：forward-websocket 或 backward-websocket"
+        },
+        {
+          "flags": "--host <host>",
+          "description": "OneBot WebSocket 主机地址"
+        },
+        {
+          "flags": "--port <port>",
+          "description": "OneBot WebSocket 端口",
+          "valueType": "int"
+        },
+        {
+          "flags": "--access-token <token>",
+          "description": "OneBot access token（可选）"
+        },
+        {
+          "flags": "--path <path>",
+          "description": "WebSocket 路径，默认 /onebot/v11/ws"
+        }
       ]
+    },
+    "compat": {
+      "pluginApi": ">=2026.3.0"
+    },
+    "install": {
+      "minHostVersion": ">=2026.3.0"
     }
   },
   "scripts": {
@@ -62,6 +93,9 @@
     "test:group-welcome": "npx tsx scripts/test-group-welcome.ts",
     "test:group-increase-handler": "npx tsx scripts/test-group-increase-handler.ts",
     "test:render-og-image": "npx tsx test/render-og-image.ts",
+    "test:smart-trigger": "npx tsx --test test/smart-trigger.test.ts test/smart-trigger-integration.test.ts test/poke.test.ts test/at.test.ts test/recall.test.ts test/quote-chain.test.ts",
+    "redteam:injection": "npx tsx test/redteam-injection/runner.ts",
+    "redteam:selfcheck": "npx tsx test/redteam-injection/runner.ts --selfcheck",
     "prepublishOnly": "npm run build",
     "pub": "npm run build && npm publish"
   },

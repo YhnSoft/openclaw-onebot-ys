@@ -1,10 +1,14 @@
+# 发布内容以 package.json 的 files 白名单为准：
+# dist、themes、skills、openclaw.plugin.json、README.md、CHANGELOG.md
+# 以下规则仅作本地打包兜底，避免源码与开发产物混入。
 src/
+test/
 scripts/
+AGENTS.md
 tsconfig.json
 *.ts
-!dist/
+*.tsbuildinfo
 .env
 .env.*
 *.log
 .DS_Store
-node_modules/

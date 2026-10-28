@@ -1,5 +1,9 @@
 node_modules/
 dist/
 *.log
+*.tsbuildinfo
 .env
 .DS_Store
+
+# 测试产物（redteam 的 reports/ 与 .canary/ 已由 test/redteam-injection/.gitignore 处理）
+test/output-*
