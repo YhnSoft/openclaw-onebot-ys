@@ -1,11 +1,11 @@
 ---
 name: onebot-ops
-description: OneBot (QQ/Lagrange) 渠道运维与使用规范。消息收发通过 Channel outbound 与 deliver 完成，不依赖 Agent 工具。
+description: OneBot (QQ/Lagrange) 渠道运维与使用规范。消息收发通过 Channel outbound 与 deliver 完成，同时提供 onebot_* Agent 工具与等价 CLI。
 ---
 
 # OneBot 运维/使用规范
 
-OneBot v11 协议渠道，支持 QQ/Lagrange.Core/go-cqhttp。消息收发均通过 Channel 的 outbound 与 deliver 完成，**不依赖 Agent 工具**。
+OneBot v11 协议渠道，支持 QQ/Lagrange.Core/go-cqhttp。消息收发通过 Channel 的 outbound 与 deliver 完成，同时注册 `onebot_*` Agent 工具并提供等价 CLI。
 
 ## 快速判断
 
@@ -19,7 +19,7 @@ OneBot v11 协议渠道，支持 QQ/Lagrange.Core/go-cqhttp。消息收发均通
 ## 插件安装
 
 ```bash
-openclaw plugins install @openclaw/onebot
+openclaw plugins install @kirigaya/openclaw-onebot
 ```
 
 本地开发时：
