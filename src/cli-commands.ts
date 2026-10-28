@@ -35,7 +35,7 @@ function parseGroupId(v: string): number {
   return n;
 }
 
-export function registerOneBotCli(onebot: any, api: any): void {
+export function registerOneBotCli(onebot: any): void {
   if (!onebot || typeof onebot.command !== "function") return;
 
   onebot

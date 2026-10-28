@@ -12,12 +12,13 @@ import WebSocket from "ws";
 import { createServer } from "http";
 import https from "https";
 import http from "http";
-import { writeFileSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync } from "fs";
+import { readdirSync, readFileSync, statSync, unlinkSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import type { OneBotAccountConfig } from "./types.js";
 import { logSend } from "./send-debug-log.js";
 import { shouldBlockSendInForwardMode, getActiveReplyTarget, getActiveReplySessionId } from "./reply-context.js";
+import { noteSentMessage } from "./recall.js";
 
 const IMAGE_TEMP_DIR = join(tmpdir(), "openclaw-onebot");
 const DOWNLOAD_TIMEOUT_MS = 30000;
@@ -75,35 +76,6 @@ function cleanupImageTemp(): void {
     }
 }
 
-/** 将 mediaUrl 解析为可发送的 file 路径。网络 URL 下载到本地，base64 解码到本地，定期清理过期文件 */
-async function resolveImageToLocalPath(image: string): Promise<string> {
-    const trimmed = image?.trim();
-    if (!trimmed) throw new Error("Empty image");
-
-    if (/^https?:\/\//i.test(trimmed)) {
-        cleanupImageTemp();
-        const buf = await downloadUrl(trimmed);
-        const ext = (trimmed.match(/\.(png|jpg|jpeg|gif|webp|bmp)(?:\?|$)/i)?.[1] ?? "png").toLowerCase();
-        mkdirSync(IMAGE_TEMP_DIR, { recursive: true });
-        const tmpPath = join(IMAGE_TEMP_DIR, `img-${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`);
-        writeFileSync(tmpPath, buf);
-        return tmpPath.replace(/\\/g, "/");
-    }
-    if (trimmed.startsWith("base64://")) {
-        cleanupImageTemp();
-        const b64 = trimmed.slice(9);
-        const buf = Buffer.from(b64, "base64");
-        mkdirSync(IMAGE_TEMP_DIR, { recursive: true });
-        const tmpPath = join(IMAGE_TEMP_DIR, `img-${Date.now()}-${Math.random().toString(36).slice(2)}.png`);
-        writeFileSync(tmpPath, buf);
-        return tmpPath.replace(/\\/g, "/");
-    }
-    if (trimmed.startsWith("file://")) {
-        return trimmed.slice(7).replace(/\\/g, "/");
-    }
-    return trimmed.replace(/\\/g, "/");
-}
-
 async function resolveImageToBuffer(image: string): Promise<Buffer> {
     const trimmed = image?.trim();
     if (!trimmed) throw new Error("Empty image");
@@ -120,44 +92,22 @@ async function resolveImageToBuffer(image: string): Promise<Buffer> {
     return readFileSync(trimmed);
 }
 
-function normalizePeerHost(host: string | undefined | null): string {
-    const trimmed = String(host ?? "").trim().toLowerCase();
-    if (!trimmed) return "";
-    const unwrapped = trimmed.replace(/^\[/, "").replace(/\]$/, "");
-    return unwrapped.startsWith("::ffff:") ? unwrapped.slice(7) : unwrapped;
-}
-
-function isLoopbackHost(host: string | undefined | null): boolean {
-    const normalized = normalizePeerHost(host);
-    return normalized === "127.0.0.1" || normalized === "::1" || normalized === "localhost";
-}
-
-function getSocketPeerHost(socket: WebSocket, getConfig?: () => OneBotAccountConfig | null): string {
-    const peerHost = (socket as OneBotSocketWithPeer).__onebotPeerHost;
-    if (peerHost) return peerHost;
-    return getConfig?.()?.host ?? "";
-}
-
-function shouldEncodeImageAsBase64(socket: WebSocket, getConfig?: () => OneBotAccountConfig | null): boolean {
-    const peerHost = getSocketPeerHost(socket, getConfig);
-    return !!peerHost && !isLoopbackHost(peerHost);
-}
-
-async function resolveImageFileForSend(
-    image: string,
-    socket: WebSocket,
-    getConfig?: () => OneBotAccountConfig | null
-): Promise<string> {
-    if (shouldEncodeImageAsBase64(socket, getConfig)) {
-        return `base64://${(await resolveImageToBuffer(image)).toString("base64")}`;
-    }
-    return resolveImageToLocalPath(image);
+async function resolveImageFileForSend(image: string): Promise<string> {
+    const trimmed = image?.trim() ?? "";
+    // OneBot 实现（NapCat / Lagrange）可能运行在 Docker 容器或远端主机上，
+    // 看不到 OpenClaw 宿主机上的临时文件路径（曾导致 send_group_msg retcode=100）。
+    // 因此本地路径 / file:// / http(s) URL 统一转 base64:// 发送，只有 base64 原样透传。
+    if (trimmed.startsWith("base64://")) return trimmed;
+    return `base64://${(await resolveImageToBuffer(trimmed)).toString("base64")}`;
 }
 
 /** 启动临时图片定期清理（每小时执行一次） */
 export function startImageTempCleanup(): void {
     stopImageTempCleanup();
     imageTempCleanupTimer = setInterval(cleanupImageTemp, IMAGE_TEMP_CLEANUP_INTERVAL_MS);
+    // 后台清理不应阻止进程退出：CLI 子命令（如 openclaw onebot setup）加载插件后
+    // 若没有 unref，事件循环永远不会清空，命令会卡在最后一行不返回。
+    imageTempCleanupTimer.unref?.();
 }
 
 /** 停止临时图片定期清理 */
@@ -178,8 +128,6 @@ let echoCounter = 0;
 let connectionReadyResolve: (() => void) | null = null;
 const connectionReadyPromise = new Promise<void>((r) => { connectionReadyResolve = r; });
 
-type OneBotSocketWithPeer = WebSocket & { __onebotPeerHost?: string };
-
 function nextEcho(): string {
     return `onebot-${Date.now()}-${++echoCounter}`;
 }
@@ -195,6 +143,27 @@ export function handleEchoResponse(payload: any): boolean {
 
 function getLogger(): { info?: (s: string) => void; warn?: (s: string) => void } {
     return (globalThis as any).__onebotApi?.logger ?? {};
+}
+
+/**
+ * 从 OneBot 响应中提取消息 ID。
+ * 不同实现的返回字段不完全一致（message_id / messageId / id，或在顶层），
+ * 全部缺失时返回 undefined，由上层决定是否生成兜底回执 ID。
+ */
+function extractMessageId(res: any): string | number | undefined {
+    const candidates = [
+        res?.data?.message_id,
+        res?.data?.messageId,
+        res?.data?.id,
+        res?.message_id,
+        res?.messageId,
+    ];
+    for (const candidate of candidates) {
+        if (candidate === null || candidate === undefined) continue;
+        const value = String(candidate).trim();
+        if (value && value !== "undefined" && value !== "null") return candidate as string | number;
+    }
+    return undefined;
 }
 
 function sendOneBotAction(wsocket: WebSocket, action: string, params: Record<string, unknown>, log = getLogger()): Promise<any> {
@@ -291,11 +260,76 @@ export async function ensureConnection(
     return waitForConnection(timeoutMs);
 }
 
+/**
+ * 解析文本中的 CQ 码为 OneBot 消息段；没有 CQ 码时返回 null（调用方保持纯文本发送）。
+ * 仅用于出站：把模型 / 插件拼出的 `[CQ:at,qq=...]` 转成真正的 at 段。
+ */
+export function textToSegments(text: string): Array<{ type: string; data: Record<string, unknown> }> | null {
+    const re = /\[CQ:([a-zA-Z_]+)((?:,[^\]]*)?)\]/g;
+    if (!re.test(text)) return null;
+    re.lastIndex = 0;
+
+    const decodeCq = (v: string): string =>
+        v
+            .replace(/&#44;/g, ",")
+            .replace(/&#91;/g, "[")
+            .replace(/&#93;/g, "]")
+            .replace(/&amp;/g, "&");
+
+    const segments: Array<{ type: string; data: Record<string, unknown> }> = [];
+    let lastIndex = 0;
+    let match: RegExpExecArray | null;
+    while ((match = re.exec(text)) !== null) {
+        if (match.index > lastIndex) {
+            segments.push({ type: "text", data: { text: text.slice(lastIndex, match.index) } });
+        }
+        const type = match[1];
+        const data: Record<string, unknown> = {};
+        const rawParams = (match[2] ?? "").replace(/^,/, "");
+        for (const kv of rawParams.split(",")) {
+            if (!kv) continue;
+            const idx = kv.indexOf("=");
+            if (idx === -1) continue;
+            data[kv.slice(0, idx)] = decodeCq(kv.slice(idx + 1));
+        }
+        segments.push({ type, data });
+        lastIndex = re.lastIndex;
+    }
+    if (lastIndex < text.length) {
+        segments.push({ type: "text", data: { text: text.slice(lastIndex) } });
+    }
+    return segments.length > 0 ? segments : null;
+}
+
+/**
+ * 构造带引用（reply 段）与 @ 段（文本里的 CQ 码）的 OneBot 消息体。
+ * 无引用且无 CQ 码时保持纯文本字符串，兼容不支持消息段数组的实现。
+ */
+function buildQuotedMessage(
+    text: string,
+    replyTo?: string | number
+): string | Array<{ type: string; data: Record<string, unknown> }> {
+    const segments = textToSegments(text);
+    const hasReply = replyTo != null && String(replyTo).trim() !== "";
+
+    if (!segments) {
+        if (!hasReply) return text;
+        return [
+            { type: "reply", data: { id: String(replyTo) } },
+            { type: "text", data: { text } },
+        ];
+    }
+
+    if (!hasReply) return segments;
+    return [{ type: "reply", data: { id: String(replyTo) } }, ...segments];
+}
+
 export async function sendPrivateMsg(
     userId: number,
     text: string,
-    getConfig?: () => OneBotAccountConfig | null
-): Promise<number | undefined> {
+    getConfig?: () => OneBotAccountConfig | null,
+    replyTo?: string | number
+): Promise<string | number | undefined> {
     if (shouldBlockSendInForwardMode("private", userId)) {
         logSend("connection", "sendPrivateMsg", { targetId: userId, blocked: true, sessionId: getActiveReplyTarget(), replySessionId: getActiveReplySessionId() });
         return undefined;
@@ -305,17 +339,19 @@ export async function sendPrivateMsg(
         targetId: userId,
         textPreview: text?.slice(0, 80),
         textLen: text?.length,
+        replyTo,
         sessionId: getActiveReplyTarget(),
         replySessionId: getActiveReplySessionId(),
     });
     const socket = getConfig
         ? await ensureConnection(getConfig)
         : await waitForConnection();
-    const res = await sendOneBotAction(socket, "send_private_msg", { user_id: userId, message: text });
+    const res = await sendOneBotAction(socket, "send_private_msg", { user_id: userId, message: buildQuotedMessage(text, replyTo) });
     if (res?.retcode !== 0) {
         throw new Error(res?.msg ?? `OneBot send_private_msg failed (retcode=${res?.retcode})`);
     }
-    const mid = res?.data?.message_id as number | undefined;
+    const mid = extractMessageId(res);
+    noteSentMessage(`user:${userId}`, mid);
     logSend("connection", "sendPrivateMsg", { targetId: userId, messageId: mid, sessionId: getActiveReplyTarget(), replySessionId: getActiveReplySessionId() });
     return mid;
 }
@@ -323,8 +359,9 @@ export async function sendPrivateMsg(
 export async function sendGroupMsg(
     groupId: number,
     text: string,
-    getConfig?: () => OneBotAccountConfig | null
-): Promise<number | undefined> {
+    getConfig?: () => OneBotAccountConfig | null,
+    replyTo?: string | number
+): Promise<string | number | undefined> {
     if (shouldBlockSendInForwardMode("group", groupId)) {
         logSend("connection", "sendGroupMsg", { targetId: groupId, blocked: true, sessionId: getActiveReplyTarget(), replySessionId: getActiveReplySessionId() });
         return undefined;
@@ -334,17 +371,19 @@ export async function sendGroupMsg(
         targetId: groupId,
         textPreview: text?.slice(0, 80),
         textLen: text?.length,
+        replyTo,
         sessionId: getActiveReplyTarget(),
         replySessionId: getActiveReplySessionId(),
     });
     const socket = getConfig
         ? await ensureConnection(getConfig)
         : await waitForConnection();
-    const res = await sendOneBotAction(socket, "send_group_msg", { group_id: groupId, message: text });
+    const res = await sendOneBotAction(socket, "send_group_msg", { group_id: groupId, message: buildQuotedMessage(text, replyTo) });
     if (res?.retcode !== 0) {
         throw new Error(res?.msg ?? `OneBot send_group_msg failed (retcode=${res?.retcode})`);
     }
-    const mid = res?.data?.message_id as number | undefined;
+    const mid = extractMessageId(res);
+    noteSentMessage(`group:${groupId}`, mid);
     logSend("connection", "sendGroupMsg", { targetId: groupId, messageId: mid, sessionId: getActiveReplyTarget(), replySessionId: getActiveReplySessionId() });
     return mid;
 }
@@ -354,7 +393,7 @@ export async function sendGroupImage(
     image: string,
     log: { info?: (s: string) => void; warn?: (s: string) => void } = getLogger(),
     getConfig?: () => OneBotAccountConfig | null
-): Promise<number | undefined> {
+): Promise<string | number | undefined> {
     if (shouldBlockSendInForwardMode("group", groupId)) {
         logSend("connection", "sendGroupImage", { targetId: groupId, blocked: true, sessionId: getActiveReplyTarget(), replySessionId: getActiveReplySessionId() });
         return undefined;
@@ -368,22 +407,20 @@ export async function sendGroupImage(
     });
     log.info?.(`[onebot] sendGroupImage entry: groupId=${groupId} image=${image?.slice?.(0, 80) ?? ""}`);
     const socket = getConfig ? await ensureConnection(getConfig) : await waitForConnection();
-    log.info?.(`222[onebot] sendGroupImage entry: groupId=${groupId} image=${image?.slice?.(0, 80) ?? ""}`);
 
     try {
-        const filePath = image.startsWith("[") ? null : await resolveImageFileForSend(image, socket, getConfig);
+        const filePath = image.startsWith("[") ? null : await resolveImageFileForSend(image);
         const seg = image.startsWith("[")
             ? JSON.parse(image)
             : [{ type: "image", data: { file: filePath! } }];
-
-        log.info?.(`333[onebot] sendGroupImage entry: groupId=${groupId} image=${image?.slice?.(0, 80) ?? ""}`);
 
         const res = await sendOneBotAction(socket, "send_group_msg", { group_id: groupId, message: seg }, log);
         if (res?.retcode !== 0) {
             throw new Error(res?.msg ?? `OneBot send_group_msg (image) failed (retcode=${res?.retcode})`);
         }
         log.info?.(`[onebot] sendGroupImage done: retcode=${res?.retcode ?? "?"}`);
-        const mid = res?.data?.message_id as number | undefined;
+        const mid = extractMessageId(res);
+        noteSentMessage(`group:${groupId}`, mid);
         logSend("connection", "sendGroupImage", { targetId: groupId, messageId: mid, sessionId: getActiveReplyTarget(), replySessionId: getActiveReplySessionId() });
         return mid;
     } catch (error) {
@@ -438,7 +475,7 @@ export async function sendPrivateImage(
     image: string,
     log: { info?: (s: string) => void; warn?: (s: string) => void } = getLogger(),
     getConfig?: () => OneBotAccountConfig | null
-): Promise<number | undefined> {
+): Promise<string | number | undefined> {
     if (shouldBlockSendInForwardMode("private", userId)) {
         logSend("connection", "sendPrivateImage", { targetId: userId, blocked: true, sessionId: getActiveReplyTarget(), replySessionId: getActiveReplySessionId() });
         return undefined;
@@ -452,7 +489,7 @@ export async function sendPrivateImage(
     });
     log.info?.(`[onebot] sendPrivateImage entry: userId=${userId} image=${image?.slice?.(0, 80) ?? ""}`);
     const socket = getConfig ? await ensureConnection(getConfig) : await waitForConnection();
-    const filePath = image.startsWith("[") ? null : await resolveImageFileForSend(image, socket, getConfig);
+    const filePath = image.startsWith("[") ? null : await resolveImageFileForSend(image);
     const seg = image.startsWith("[")
         ? JSON.parse(image)
         : [{ type: "image", data: { file: filePath! } }];
@@ -461,7 +498,8 @@ export async function sendPrivateImage(
         throw new Error(res?.msg ?? `OneBot send_private_msg (image) failed (retcode=${res?.retcode})`);
     }
     log.info?.(`[onebot] sendPrivateImage done: retcode=${res?.retcode ?? "?"}`);
-    const mid = res?.data?.message_id as number | undefined;
+    const mid = extractMessageId(res);
+    noteSentMessage(`user:${userId}`, mid);
     logSend("connection", "sendPrivateImage", { targetId: userId, messageId: mid, sessionId: getActiveReplyTarget(), replySessionId: getActiveReplySessionId() });
     return mid;
 }
@@ -499,7 +537,10 @@ export async function uploadPrivateFile(
 /** 撤回消息 */
 export async function deleteMsg(messageId: number): Promise<void> {
     if (!ws || ws.readyState !== WebSocket.OPEN) throw new Error("OneBot WebSocket not connected");
-    await sendOneBotAction(ws, "delete_msg", { message_id: messageId });
+    const res = await sendOneBotAction(ws, "delete_msg", { message_id: messageId });
+    if (res?.retcode !== 0) {
+        throw new Error(res?.msg ?? `OneBot delete_msg failed (retcode=${res?.retcode})`);
+    }
 }
 
 /**
@@ -511,6 +552,38 @@ export async function deleteMsg(messageId: number): Promise<void> {
 export async function setMsgEmojiLike(message_id: number, emoji_id: number, is_set: boolean = true): Promise<void> {
     if (!ws || ws.readyState !== WebSocket.OPEN) throw new Error("OneBot WebSocket not connected");
     await sendOneBotAction(ws, "set_msg_emoji_like", { message_id, emoji_id, is_set });
+}
+
+/**
+ * 戳一戳（群聊）：NapCat / Lagrange 扩展 API `group_poke`
+ * @param groupId 群号
+ * @param userId 被戳的人
+ */
+export async function sendGroupPoke(
+    groupId: number,
+    userId: number,
+    getConfig?: () => OneBotAccountConfig | null
+): Promise<void> {
+    const socket = getConfig ? await ensureConnection(getConfig) : await waitForConnection();
+    const res = await sendOneBotAction(socket, "group_poke", { group_id: groupId, user_id: userId });
+    if (res?.retcode !== 0) {
+        throw new Error(res?.msg ?? `OneBot group_poke failed (retcode=${res?.retcode})`);
+    }
+}
+
+/**
+ * 戳一戳（私聊）：NapCat / Lagrange 扩展 API `friend_poke`
+ * @param userId 被戳的人
+ */
+export async function sendFriendPoke(
+    userId: number,
+    getConfig?: () => OneBotAccountConfig | null
+): Promise<void> {
+    const socket = getConfig ? await ensureConnection(getConfig) : await waitForConnection();
+    const res = await sendOneBotAction(socket, "friend_poke", { user_id: userId });
+    if (res?.retcode !== 0) {
+        throw new Error(res?.msg ?? `OneBot friend_poke failed (retcode=${res?.retcode})`);
+    }
 }
 
 /** 获取陌生人信息（含 nickname） */
@@ -757,7 +830,6 @@ export async function connectForward(config: OneBotAccountConfig): Promise<WebSo
         w.on("open", () => resolve());
         w.on("error", reject);
     });
-    (w as OneBotSocketWithPeer).__onebotPeerHost = config.host;
     return w;
 }
 
@@ -772,11 +844,10 @@ export async function createServerAndWait(config: OneBotAccountConfig): Promise<
     const host = config.host || "0.0.0.0";
     server.listen(config.port, host);
 
-    wsServer = wss as any;
+    wsServer = wss;
 
     return new Promise((resolve) => {
-        wss.on("connection", (socket: WebSocket, req) => {
-            (socket as OneBotSocketWithPeer).__onebotPeerHost = req.socket.remoteAddress ?? undefined;
+        wss.on("connection", (socket: WebSocket) => {
             resolve(socket as WebSocket);
         });
     });

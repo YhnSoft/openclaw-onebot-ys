@@ -14,6 +14,7 @@ import { registerService } from "./service.js";
 import { startImageTempCleanup } from "./connection.js";
 import { startForwardCleanupTimer } from "./handlers/process-inbound.js";
 import { registerOneBotCli } from "./cli-commands.js";
+import { registerTools } from "./tools.js";
 import { createRequire } from "module";
 
 const require = createRequire(import.meta.url);
@@ -49,7 +50,7 @@ export default function register(api: any): void {
             const { runOneBotSetup } = await import("./setup.js");
             await runOneBotSetup();
           });
-          registerOneBotCli(onebot, api);
+          registerOneBotCli(onebot);
         }
       },
       { commands: ["onebot"] }
@@ -57,6 +58,19 @@ export default function register(api: any): void {
   }
 
   registerService(api);
+
+  // Agent 工具：群历史、搜人、发图/表情包/文件、撤回等。
+  // 宿主不提供 registerTool 时跳过，不影响渠道本身。
+  try {
+    if (typeof api.registerTool === "function") {
+      registerTools(api);
+      logger?.info?.(`[${pluginName}] Agent 工具已注册（onebot_*）`);
+    } else {
+      logger?.warn?.(`[${pluginName}] 宿主不支持 api.registerTool，跳过 Agent 工具注册`);
+    }
+  } catch (error: any) {
+    logger?.warn?.(`[${pluginName}] Agent 工具注册失败: ${error?.message ?? error}`);
+  }
 
   if (logger?.info) {
     logger.info(`[${pluginName}] v${pluginVersion} 加载完成`);

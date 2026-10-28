@@ -35,6 +35,8 @@ export function logSend(
     /** 回复会话 ID，同一问题下多次 deliver 共享 */
     replySessionId?: string | null;
     messageId?: number | string;
+    /** 本次发送引用的消息 ID */
+    replyTo?: number | string;
     isForward?: boolean;
     nodeCount?: number;
     imagePreview?: string;

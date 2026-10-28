@@ -26,6 +26,10 @@ export function getTextFromMessageContent(content: string | unknown[] | undefine
     if (seg?.type === "text") {
       const t = (seg.data?.text as string) ?? "";
       if (t) parts.push(t);
+    } else if (seg?.type === "at") {
+      // 保留被 @ 的 QQ 号，供模型理解「谁在叫谁」并正确 @ 回去
+      const qq = (seg.data?.qq as string) ?? (seg.data?.id as string) ?? "";
+      if (qq) parts.push(`@${qq} `);
     } else if (seg?.type === "image") {
       const url = (seg.data?.url as string) ?? (seg.data?.file as string) ?? "";
       parts.push(url ? `[图片: ${url}]` : "[图片]");
@@ -52,9 +56,27 @@ export function getRawText(msg: OneBotMessage): string {
   return getTextFromSegments(msg);
 }
 
+/** 提取消息里 @ 的目标 QQ 号（过滤 @全体成员 等非数字目标） */
+export function getAtTargets(msg: OneBotMessage): number[] {
+  const arr = msg?.message;
+  if (!Array.isArray(arr)) return [];
+  const out: number[] = [];
+  for (const m of arr) {
+    if (m?.type !== "at") continue;
+    const data = (m?.data ?? {}) as Record<string, unknown>;
+    const raw = data.qq ?? data.id;
+    if (raw == null) continue;
+    const text = String(raw).trim();
+    if (!text || text === "all") continue;
+    const num = Number(text);
+    if (Number.isFinite(num)) out.push(num);
+  }
+  return out;
+}
+
 export function isMentioned(msg: OneBotMessage, selfId: number): boolean {
   const arr = msg.message;
   if (!Array.isArray(arr)) return false;
   const selfStr = String(selfId);
-  return arr.some((m) => m?.type === "at" && String((m?.data as any)?.qq || (m?.data as any)?.id) === selfStr);
+  return arr.some((m) => m?.type === "at" && String(m?.data?.qq || m?.data?.id) === selfStr);
 }

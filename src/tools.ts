@@ -20,9 +20,12 @@ import {
   getGroupMemberInfo,
   searchGroupMemberByName,
   getAvatarUrl,
+  deleteMsg,
 } from "./connection.js";
 import { getRenderMarkdownToPlain } from "./config.js";
 import { markdownToPlain } from "./markdown.js";
+import { addSticker, pickSticker, findStickers, loadStickers } from "./stickers.js";
+import { normalizeRecallTarget, getLastSentMessage, clearLastSentMessage } from "./recall.js";
 
 export interface OneBotClient {
   sendGroupMsg: typeof sendGroupMsg;
@@ -57,34 +60,114 @@ export function registerTools(api: any): void {
 
   api.registerTool({
     name: "onebot_send_text",
-    description: "通过 OneBot 发送文本消息。target 格式：user:QQ号 或 group:群号",
+    description: "通过 OneBot 发送文本消息。target 格式：user:QQ号 或 group:群号。可选 replyToMessageId 引用某条消息（消息ID取自上下文里每条消息前的 [#数字]）。",
     parameters: {
       type: "object",
       properties: {
         target: { type: "string", description: "user:123456 或 group:789012" },
         text: { type: "string", description: "要发送的文本" },
+        replyToMessageId: {
+          type: ["number", "string"],
+          description: "可选。要引用的消息 ID（整数，可能为负数），来自上下文中的 [#消息ID]",
+        },
       },
       required: ["target", "text"],
     },
-    async execute(_id: string, params: { target: string; text: string }) {
+    async execute(_id: string, params: { target: string; text: string; replyToMessageId?: number | string }) {
       const w = getWs();
       if (!w || w.readyState !== WebSocket.OPEN) {
         return { content: [{ type: "text", text: "OneBot 未连接" }] };
       }
-      const cfg = (api as any)?.config;
+      const cfg = api?.config;
       const textToSend = getRenderMarkdownToPlain(cfg) ? markdownToPlain(params.text) : params.text;
       const t = params.target.replace(/^onebot:/i, "");
+      const replyTo = params.replyToMessageId;
       try {
+        let mid: string | number | undefined;
         if (t.startsWith("group:")) {
-          await sendGroupMsg(parseInt(t.slice(6), 10), textToSend);
+          mid = await sendGroupMsg(parseInt(t.slice(6), 10), textToSend, undefined, replyTo);
         } else {
           const id = parseInt(t.replace(/^user:/, ""), 10);
-          await sendPrivateMsg(id, textToSend);
+          mid = await sendPrivateMsg(id, textToSend, undefined, replyTo);
         }
-        return { content: [{ type: "text", text: "发送成功" }] };
+        return { content: [{ type: "text", text: mid != null ? `发送成功，消息ID: ${mid}` : "发送成功" }] };
       } catch (e: any) {
         return { content: [{ type: "text", text: `发送失败: ${e?.message}` }] };
       }
+    },
+  });
+
+  api.registerTool({
+    name: "onebot_sticker_save",
+    description: "把一张表情包/图片记录到本地表情包库，之后可用 onebot_sticker_send 发送。image 取群里消息中的 [图片: url]。note 写它的含义/情绪（如「无语」「点赞」），便于以后按关键词检索。",
+    parameters: {
+      type: "object",
+      properties: {
+        image: { type: "string", description: "图片 URL 或本地路径" },
+        note: { type: "string", description: "这个表情包表示的意思/情绪" },
+        tags: { type: "array", items: { type: "string" }, description: "可选的标签" },
+      },
+      required: ["image"],
+    },
+    async execute(_id: string, params: { image: string; note?: string; tags?: string[] }) {
+      try {
+        const entry = await addSticker({ url: params.image, note: params.note, tags: params.tags });
+        const extra = entry.file ? "，已保存到本地" : "";
+        return { content: [{ type: "text", text: `已记录表情包 ${entry.id}${entry.note ? `（${entry.note}）` : ""}${extra}` }] };
+      } catch (e: any) {
+        return { content: [{ type: "text", text: `记录失败: ${e?.message ?? e}` }] };
+      }
+    },
+  });
+
+  api.registerTool({
+    name: "onebot_sticker_send",
+    description: "从本地表情包库挑一张发送。query 为关键词（匹配备注/标签），不传则随机；也可传 stickerId 指定。target 格式：user:QQ号 或 group:群号。",
+    parameters: {
+      type: "object",
+      properties: {
+        target: { type: "string", description: "user:123456 或 group:789012" },
+        query: { type: "string", description: "可选关键词，如 可爱 / 无语" },
+        stickerId: { type: "string", description: "可选，指定表情包 id" },
+      },
+      required: ["target"],
+    },
+    async execute(_id: string, params: { target: string; query?: string; stickerId?: string }) {
+      const w = getWs();
+      if (!w || w.readyState !== WebSocket.OPEN) {
+        return { content: [{ type: "text", text: "OneBot 未连接" }] };
+      }
+      const entry = params.stickerId ? findStickers(params.stickerId)[0] : pickSticker(params.query);
+      if (!entry) {
+        return { content: [{ type: "text", text: "表情包库是空的，先让我记录几张吧" }] };
+      }
+      const source = entry.file ?? entry.url;
+      if (!source) return { content: [{ type: "text", text: "这张表情包没有可用来源" }] };
+      const t = params.target.replace(/^onebot:/i, "");
+      try {
+        let mid: string | number | undefined;
+        if (t.startsWith("group:")) {
+          mid = await sendGroupImage(parseInt(t.slice(6), 10), source);
+        } else {
+          mid = await sendPrivateImage(parseInt(t.replace(/^user:/, ""), 10), source);
+        }
+        const tail = mid != null ? `，消息ID: ${mid}` : "";
+        return { content: [{ type: "text", text: `已发送表情包 ${entry.id}${entry.note ? `（${entry.note}）` : ""}${tail}` }] };
+      } catch (e: any) {
+        return { content: [{ type: "text", text: `发送失败: ${e?.message ?? e}` }] };
+      }
+    },
+  });
+
+  api.registerTool({
+    name: "onebot_sticker_list",
+    description: "列出本地表情包库（id、含义、使用次数）。",
+    parameters: { type: "object", properties: {}, required: [] },
+    async execute(_id: string, _params: Record<string, never>) {
+      const list = loadStickers();
+      if (list.length === 0) return { content: [{ type: "text", text: "表情包库是空的" }] };
+      const lines = list.slice(-50).map((s) => `- ${s.id}：${s.note ?? "未备注"}${s.tags.length ? ` [${s.tags.join("/")}]` : ""} 用过${s.uses}次`);
+      return { content: [{ type: "text", text: `共 ${list.length} 张：\n${lines.join("\n")}` }] };
     },
   });
 
@@ -106,14 +189,57 @@ export function registerTools(api: any): void {
       }
       const t = params.target.replace(/^onebot:/i, "");
       try {
+        let mid: string | number | undefined;
         if (t.startsWith("group:")) {
-          await sendGroupImage(parseInt(t.slice(6), 10), params.image);
+          mid = await sendGroupImage(parseInt(t.slice(6), 10), params.image);
         } else {
-          await sendPrivateImage(parseInt(t.replace(/^user:/, ""), 10), params.image);
+          mid = await sendPrivateImage(parseInt(t.replace(/^user:/, ""), 10), params.image);
         }
-        return { content: [{ type: "text", text: "图片发送成功" }] };
+        return { content: [{ type: "text", text: mid != null ? `图片发送成功，消息ID: ${mid}` : "图片发送成功" }] };
       } catch (e: any) {
         return { content: [{ type: "text", text: `发送失败: ${e?.message}` }] };
+      }
+    },
+  });
+
+  api.registerTool({
+    name: "onebot_recall",
+    description: "撤回机器人自己发出的消息（说错话时用）。不传 messageId 时，撤回 target 会话里机器人最近发送的一条；也可用 messageId 精确指定。target 格式：group:群号 或 user:QQ号。只能撤回自己发的消息，QQ 通常只允许 2 分钟内撤回。",
+    parameters: {
+      type: "object",
+      properties: {
+        target: { type: "string", description: "group:123456 或 user:123456；不传 messageId 时用它定位最近一条" },
+        messageId: { type: ["number", "string"], description: "可选，要撤回的消息 ID（发送成功时返回的「消息ID」）" },
+      },
+      required: [],
+    },
+    async execute(_id: string, params: { target?: string; messageId?: number | string }) {
+      const w = getWs();
+      if (!w || w.readyState !== WebSocket.OPEN) {
+        return { content: [{ type: "text", text: "OneBot 未连接" }] };
+      }
+      const target = normalizeRecallTarget(params?.target ?? "");
+      let messageId: number | undefined;
+      if (params?.messageId != null && String(params.messageId).trim() !== "") {
+        const n = Number(params.messageId);
+        if (!Number.isFinite(n) || n === 0) {
+          return { content: [{ type: "text", text: "messageId 非法" }] };
+        }
+        messageId = n;
+      } else if (target) {
+        messageId = getLastSentMessage(target);
+        if (messageId == null) {
+          return { content: [{ type: "text", text: "没有记录到该会话最近发送的消息，请传 messageId" }] };
+        }
+      } else {
+        return { content: [{ type: "text", text: "需要 target 或 messageId" }] };
+      }
+      try {
+        await deleteMsg(messageId);
+        if (target) clearLastSentMessage(target, messageId);
+        return { content: [{ type: "text", text: `已撤回消息 ${messageId}` }] };
+      } catch (e: any) {
+        return { content: [{ type: "text", text: `撤回失败: ${e?.message ?? e}` }] };
       }
     },
   });

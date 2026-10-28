@@ -5,7 +5,6 @@
 import {
   cancel as clackCancel,
   confirm as clackConfirm,
-  intro as clackIntro,
   isCancel,
   note as clackNote,
   outro as clackOutro,
@@ -167,9 +166,25 @@ export async function runOneBotSetup(): Promise<void> {
     ...(blacklistIds.length > 0 ? { blacklistUserIds: blacklistIds } : {}),
   };
 
-  const next = { ...existing, channels };
+  // OpenClaw 2026.x 要求外部插件在 config 中显式声明信任（plugins.entries.<id>.enabled=true），
+  // 否则 Gateway 只会发现插件而不会加载它，频道也就不会注册/启动。
+  const plugins = { ...(existing.plugins || {}) };
+  const entries = { ...(plugins.entries || {}) };
+  entries["openclaw-onebot"] = { ...(entries["openclaw-onebot"] || {}), enabled: true };
+  plugins.entries = entries;
+  // 与 `openclaw plugins install` 行为一致：遵守已有 allow 列表策略，并把本插件纳入。
+  if (Array.isArray(plugins.allow) && plugins.allow.length > 0) {
+    const allow = plugins.allow.map((id: unknown) => String(id));
+    if (!allow.includes("openclaw-onebot")) allow.push("openclaw-onebot");
+    plugins.allow = allow;
+  }
+  if (Array.isArray(plugins.deny)) {
+    plugins.deny = plugins.deny.map((id: unknown) => String(id)).filter((id: string) => id !== "openclaw-onebot");
+  }
+
+  const next = { ...existing, plugins, channels };
   writeFileSync(CONFIG_PATH, JSON.stringify(next, null, 2), "utf-8");
 
   clackNote(`配置已保存到 ${CONFIG_PATH}`, "完成");
-  clackOutro("运行 openclaw gateway restart 使配置生效");
+  clackOutro("已启用插件。运行 openclaw gateway restart 使配置生效");
 }

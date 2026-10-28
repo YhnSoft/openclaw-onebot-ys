@@ -13,6 +13,7 @@ import { resolveTargetForReply, getForwardSuppressDelivery, isTargetActiveReply,
 import { logSend } from "./send-debug-log.js";
 import { getRenderMarkdownToPlain, getCollapseDoubleNewlines } from "./config.js";
 import { markdownToPlain, collapseDoubleNewlines } from "./markdown.js";
+import { normalizeAtMarkers } from "./at.js";
 
 export interface OneBotSendResult {
   ok: boolean;
@@ -50,7 +51,8 @@ export async function sendTextMessage(
   to: string,
   text: string,
   getConfig?: OneBotConfigGetter,
-  cfg?: { channels?: { onebot?: { renderMarkdownToPlain?: boolean } } }
+  cfg?: { channels?: { onebot?: { renderMarkdownToPlain?: boolean } } },
+  replyTo?: string | number
 ): Promise<OneBotSendResult> {
   const forwardSuppress = getForwardSuppressDelivery();
   const activeTarget = getActiveReplyTarget();
@@ -79,13 +81,15 @@ export async function sendTextMessage(
 
   let finalText = getRenderMarkdownToPlain(cfg) ? markdownToPlain(text) : text.trim();
   if (getCollapseDoubleNewlines(cfg)) finalText = collapseDoubleNewlines(finalText);
+  // [[at:QQ]] / 空 CQ 码规范化：合法 at 转 CQ 码交由发送层拆成 at 段，空号直接剥除
+  finalText = normalizeAtMarkers(finalText).text;
 
   try {
-    let messageId: number | undefined;
+    let messageId: string | number | undefined;
     if (target.type === "group") {
-      messageId = await sendGroupMsg(target.id, finalText, getConfig);
+      messageId = await sendGroupMsg(target.id, finalText, getConfig, replyTo);
     } else {
-      messageId = await sendPrivateMsg(target.id, finalText, getConfig);
+      messageId = await sendPrivateMsg(target.id, finalText, getConfig, replyTo);
     }
     logSend("send", "sendTextMessage", {
       targetType: target.type,
@@ -144,7 +148,7 @@ export async function sendMediaMessage(
   let finalText = text?.trim() ? (getRenderMarkdownToPlain(cfg) ? markdownToPlain(text) : text.trim()) : "";
   if (finalText && getCollapseDoubleNewlines(cfg)) finalText = collapseDoubleNewlines(finalText);
   try {
-    let messageId: number | undefined;
+    let messageId: string | number | undefined;
     if (finalText) {
       if (target.type === "group") {
         messageId = await sendGroupMsg(target.id, finalText, getConfig);

@@ -5,10 +5,7 @@
 import type { OneBotMessage } from "../types.js";
 import { getOneBotConfig } from "../config.js";
 import {
-    getRawText,
     getTextFromSegments,
-    getReplyMessageId,
-    getTextFromMessageContent,
     isMentioned,
 } from "../message.js";
 import {
@@ -19,10 +16,14 @@ import {
     getOgImageRenderTheme,
     getNormalModeFlushIntervalMs,
     getNormalModeFlushChars,
-    getTriggerKeywords,
-    getTriggerMode,
     getReplyWhenWhitelistDenied,
+    getHistoryLimit,
+    getQuoteEnabled,
+    getAtEnabled,
+    getSmartTriggerConfig,
 } from "../config.js";
+import type { JudgeIntent } from "../smart-trigger.js";
+import { normalizeAtMarkers } from "../at.js";
 import { markdownToPlain, collapseDoubleNewlines } from "../markdown.js";
 import { markdownToImage } from "../og-image.js";
 import {
@@ -33,112 +34,30 @@ import {
     sendGroupForwardMsg,
     sendPrivateForwardMsg,
     setMsgEmojiLike,
-    getMsg,
-    getStrangerInfo,
-    getGroupMemberInfo,
 } from "../connection.js";
 import { setActiveReplyTarget, clearActiveReplyTarget, setActiveReplySessionId, setForwardSuppressDelivery, setActiveReplySelfId } from "../reply-context.js";
 import { loadPluginSdk, getSdk } from "../sdk.js";
 import { handleGroupIncrease } from "./group-increase.js";
+import { decideGroupTrigger } from "./inbound-trigger.js";
+import { buildInboundBody, buildInboundEnvelope } from "./inbound-prompt.js";
+import { parseInboundMessage, resolveSenderNickname, type ParseInboundDeps } from "./inbound-parse.js";
+import { markForwardPending, clearForwardPending } from "./inbound-forward.js";
 
-const DEFAULT_HISTORY_LIMIT = 20;
+// forward 模式的待处理会话与清理定时器见 inbound-forward.ts；
+// 这里保留 re-export，避免改动 index.ts 的调用路径。
+export { startForwardCleanupTimer } from "./inbound-forward.js";
+
+/** 历史条目里单条消息的最大字符数，避免长消息把上下文撑爆 */
+const HISTORY_ENTRY_MAX_CHARS = 500;
 export const sessionHistories = new Map<string, Array<{ sender: string; body: string; timestamp: number; messageId: string }>>();
 
-/**
- * 检查消息是否匹配触发关键词
- * @param text 消息文本
- * @param keywords 关键词列表
- * @param mode 匹配模式：prefix-前缀匹配，contains-包含匹配
- */
-function checkTriggerKeyword(text: string, keywords: string[], mode: "prefix" | "contains"): boolean {
-    if (!text || keywords.length === 0) return false;
-
-    for (const keyword of keywords) {
-        if (!keyword) continue;
-
-        if (mode === "prefix") {
-            // 前缀匹配：消息以关键词开头（忽略前导空格）
-            const trimmedText = text.trimStart();
-            if (trimmedText.toLowerCase().startsWith(keyword.toLowerCase())) {
-                return true;
-            }
-        } else {
-            // 包含匹配：消息中包含关键词即可
-            if (text.toLowerCase().includes(keyword.toLowerCase())) {
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
-/** forward 模式下待处理的会话，用于定期清理未完成的缓冲 */
-const forwardPendingSessions = new Map<string, number>();
 /** 每个 replySessionId 已发送的 chunk 数量，用于支持多次 final（如工具调用后追加内容） */
 const lastSentChunkCountBySession = new Map<string, number>();
-const FORWARD_PENDING_TTL_MS = 5 * 60 * 1000; // 5 分钟
-const FORWARD_CLEANUP_INTERVAL_MS = 60 * 1000; // 每分钟清理一次
 
-function cleanupForwardPendingSessions(): void {
-    const now = Date.now();
-    const toDelete: string[] = [];
-    for (const [id, ts] of forwardPendingSessions) {
-        if (now - ts > FORWARD_PENDING_TTL_MS) toDelete.push(id);
-    }
-    for (const id of toDelete) forwardPendingSessions.delete(id);
-}
+/** processInboundMessage 的可注入依赖（测试用；生产环境全部走默认实现） */
+export type ProcessInboundDeps = ParseInboundDeps;
 
-let forwardCleanupTimer: ReturnType<typeof setInterval> | null = null;
-export function startForwardCleanupTimer(): void {
-    if (forwardCleanupTimer) return;
-    forwardCleanupTimer = setInterval(cleanupForwardPendingSessions, FORWARD_CLEANUP_INTERVAL_MS);
-}
-
-const nicknameCache = new Map<string, { nickname: string; ts: number }>();
-const NICKNAME_CACHE_TTL_MS = 5 * 60 * 1000; // 5 分钟
-
-/**
- * 解析发送者展示名称。
- * 优先使用消息体自带的群名片/昵称；若缺失，则通过 OneBot API 查询并缓存。
- * 最终格式为 nickname(qq: userId)，确保 AI 上下文中同时包含昵称与 ID。
- */
-async function resolveSenderNickname(
-    userId: number,
-    groupId: number | undefined,
-    isGroup: boolean,
-    senderFromMsg?: { nickname?: string; card?: string }
-): Promise<string> {
-    const card = senderFromMsg?.card?.trim();
-    const nickname = senderFromMsg?.nickname?.trim();
-    const base = card || nickname || "";
-    if (base) {
-        return `${base}(qq: ${userId})`;
-    }
-
-    const cacheKey = isGroup && groupId ? `group:${groupId}:${userId}` : `user:${userId}`;
-    const cached = nicknameCache.get(cacheKey);
-    if (cached && Date.now() - cached.ts < NICKNAME_CACHE_TTL_MS) {
-        return `${cached.nickname}(qq: ${userId})`;
-    }
-
-    let resolved = "";
-    if (isGroup && groupId) {
-        const info = await getGroupMemberInfo(groupId, userId);
-        resolved = info?.card?.trim() || info?.nickname?.trim() || "";
-    } else {
-        const info = await getStrangerInfo(userId);
-        resolved = info?.nickname?.trim() || "";
-    }
-
-    if (resolved) {
-        nicknameCache.set(cacheKey, { nickname: resolved, ts: Date.now() });
-        return `${resolved}(qq: ${userId})`;
-    }
-
-    return String(userId);
-}
-
-export async function processInboundMessage(api: any, msg: OneBotMessage): Promise<void> {
+export async function processInboundMessage(api: any, msg: OneBotMessage, deps: ProcessInboundDeps = {}): Promise<void> {
     await loadPluginSdk();
     const { buildPendingHistoryContextFromMap, recordPendingHistoryEntry, clearHistoryEntriesIfEnabled } = getSdk();
 
@@ -159,58 +78,95 @@ export async function processInboundMessage(api: any, msg: OneBotMessage): Promi
         return;
     }
 
-    const replyId = getReplyMessageId(msg);
-    let messageText: string;
-    if (replyId != null) {
-        const userText = getTextFromSegments(msg);
-        try {
-            const quoted = await getMsg(replyId);
-            const quotedText = quoted ? getTextFromMessageContent(quoted.message) : "";
-            const senderLabel = quoted?.sender?.nickname ?? quoted?.sender?.user_id ?? "某人";
-            messageText = quotedText.trim()
-                ? `[引用 ${String(senderLabel)} 的消息：${quotedText.trim()}]\n${userText}`
-                : userText;
-        } catch {
-            messageText = userText;
-        }
-    } else {
-        messageText = getRawText(msg);
-    }
-    if (!messageText?.trim()) {
-        api.logger?.info?.(`[onebot] ignoring empty message`);
-        return;
-    }
+    // 解析正文 / 引用链 / 引用机器人标记 / 媒体附件（实现见 inbound-parse.ts）
+    const parsed = await parseInboundMessage(api, msg, selfId, deps);
+    if (!parsed) return;
+    const { messageText, quotedText, isQuoteToBot, mediaFacts, replyId } = parsed;
 
     const isGroup = msg.message_type === "group";
     const cfg = api.config;
-    const requireMention = (cfg?.channels?.onebot as any)?.requireMention ?? true;
+    const historyLimit = getHistoryLimit(cfg);
 
-    // 触发检查逻辑
-    if (isGroup) {
-        const isAtMentioned = isMentioned(msg, selfId);
+    // 会话信息提前解析：群聊历史记录与后续 dispatch 必须使用同一个 sessionId
+    const userId = msg.user_id!;
+    const groupId = msg.group_id;
+    const tempSessionId = isGroup
+        ? `onebot:group:${groupId}`.toLowerCase()
+        : `onebot:${userId}`.toLowerCase();
+    const peer = isGroup
+        ? { kind: "group", id: String(groupId) }
+        : { kind: "direct", id: String(userId) };
+    const route = runtime.channel.routing?.resolveAgentRoute?.({
+        cfg,
+        sessionKey: tempSessionId,
+        channel: "onebot",
+        accountId: config.accountId ?? "default",
+        peer,
+    }) ?? { agentId: "main" };
+    const sessionId = `agent:${route.agentId}:${tempSessionId}`;
+    const storePath =
+        runtime.channel.session?.resolveStorePath?.(cfg?.session?.store, {
+            agentId: route.agentId,
+        }) ?? "";
+    const fromLabel = await resolveSenderNickname(Number(userId), groupId, isGroup, msg.sender);
 
-        if (requireMention) {
-            // 传统模式：必须 @ 才响应
-            if (!isAtMentioned) {
-                api.logger?.info?.(`[onebot] ignoring group message without @mention`);
-                return;
-            }
-        } else {
-            // 关键词模式：配置 triggerKeywords 时，需匹配关键词才响应
-            const triggerKeywords = getTriggerKeywords(cfg);
-            if (triggerKeywords.length > 0) {
-                const triggerMode = getTriggerMode(cfg);
-                const textFromMsg = getTextFromSegments(msg).trim() || messageText.trim();
-                const matched = checkTriggerKeyword(textFromMsg, triggerKeywords, triggerMode);
+    /**
+     * 把一条群消息记入会话历史（包括不触发回复的消息）。
+     * 这样下次被 @ / 命中关键词时，模型能看到之前群里聊了什么（参考 openclaw-feishu 的 pending history）。
+     */
+    const rememberMessage = (): void => {
+        if (!recordPendingHistoryEntry || historyLimit <= 0) return;
+        const body = messageText.length > HISTORY_ENTRY_MAX_CHARS
+            ? `${messageText.slice(0, HISTORY_ENTRY_MAX_CHARS)}…`
+            : messageText;
+        recordPendingHistoryEntry({
+            historyMap: sessionHistories,
+            historyKey: sessionId,
+            entry: {
+                sender: fromLabel,
+                body,
+                timestamp: Date.now(),
+                // 记录真实 OneBot 消息 id，供模型引用时使用
+                messageId: msg.message_id != null ? String(msg.message_id) : `onebot-${Date.now()}`,
+            },
+            limit: historyLimit,
+        });
+    };
 
-                if (!matched) {
-                    api.logger?.info?.(`[onebot] ignoring group message, no trigger keyword matched`);
-                    return;
-                }
-                api.logger?.info?.(`[onebot] trigger keyword matched, processing message`);
-            }
-            // 如果没有配置关键词，则所有消息都响应（降级到原逻辑）
-        }
+    // 智能触发配置：未显式开启 smartTrigger.enabled 时下面的分支完全走原逻辑
+    const smart = getSmartTriggerConfig(cfg);
+    const isAtMentioned = isGroup && isMentioned(msg, selfId);
+    /** 智能触发放行后的接话方式：sass 时在 prompt 里注入吐槽风格提示 */
+    let smartReplyIntent: JudgeIntent | undefined;
+
+    // 触发检查逻辑（poke 等内部合成消息带 __onebotForceDispatch，直接跳过 @/关键词/LLM 判定）
+    const forceDispatch = (msg as any).__onebotForceDispatch === true;
+    if (isGroup && !forceDispatch) {
+        // 判定链见 inbound-trigger.ts：@ → 引用机器人 → 智能触发两段式 → requireMention → 关键词。
+        // skip 时判定模块内部已 rememberMessage，这里直接结束。
+        const decision = await decideGroupTrigger({
+            api,
+            cfg,
+            msg,
+            groupId: Number(groupId),
+            userId: Number(userId),
+            selfId,
+            messageText,
+            quotedText,
+            senderLabel: fromLabel,
+            isAtMentioned,
+            isQuoteToBot,
+            smart,
+            recentMessages: (limit) => {
+                const entries = sessionHistories.get(sessionId) ?? [];
+                return limit > 0
+                    ? entries.slice(-limit).map((e) => ({ sender: e.sender, body: e.body }))
+                    : [];
+            },
+            rememberMessage,
+        });
+        if (!decision.dispatch) return;
+        smartReplyIntent = decision.smartReplyIntent;
     }
 
     const gi = (cfg?.channels?.onebot as Record<string, unknown>)?.groupIncrease as Record<string, unknown> | undefined;
@@ -228,8 +184,6 @@ export async function processInboundMessage(api: any, msg: OneBotMessage): Promi
         await handleGroupIncrease(api, fakeMsg);
         return;
     }
-
-    const userId = msg.user_id!;
 
     // 白名单检查
     const whitelist = getWhitelistUserIds(cfg);
@@ -252,108 +206,53 @@ export async function processInboundMessage(api: any, msg: OneBotMessage): Promi
         api.logger?.info?.(`[onebot] user ${userId} is in blacklist, ignored`);
         return;
     }
-    const groupId = msg.group_id;
-    const tempSessionId = isGroup
-        ? `onebot:group:${groupId}`.toLowerCase()
-        : `onebot:${userId}`.toLowerCase();
 
-    const peer = isGroup
-        ? { kind: "group", id: String(groupId) }
-        : { kind: "direct", id: String(userId) };
-    const route = runtime.channel.routing?.resolveAgentRoute?.({
-        cfg,
-        sessionKey: tempSessionId,
-        channel: "onebot",
-        accountId: config.accountId ?? "default",
-        peer,
-    }) ?? { agentId: "main" };
-
-    // 修复构造符合 OpenClaw 规范的全局 SessionKey格式必须为 agent:{agentId}:{channel}:{type}:{id}，否则下方的dispatchReplyWithBufferedBlockDispatcher会触发自动兜底机制，直接在 main 代理下“克隆”出一个一模一样的会话，导致多agent配置达不到效果
-    const sessionId = `agent:${route.agentId}:${tempSessionId}`;
-    const storePath =
-        runtime.channel.session?.resolveStorePath?.(cfg?.session?.store, {
-            agentId: route.agentId,
-        }) ?? "";
-
-    const envelopeOptions = runtime.channel.reply?.resolveEnvelopeFormatOptions?.(cfg) ?? {};
-    const chatType = isGroup ? "group" : "direct";
-    const fromLabel = await resolveSenderNickname(Number(userId), groupId, isGroup, msg.sender);
+    // 引用机器人直通：确认已通过白/黑名单后再记日志，避免与权限拒绝日志顺序矛盾
+    if (isGroup && isQuoteToBot) {
+        api.logger?.info?.(`[onebot][smart] group=${groupId} decision=reply source=quote-to-bot replyId=${replyId} intent=answer`);
+    }
 
     // 添加日志：打印插件接收到的原始消息内容
     api.logger?.info?.(`[onebot] received message from user ${userId}: "${messageText}"`);
 
-    const formattedBody =
-        runtime.channel.reply?.formatInboundEnvelope?.({
-            channel: "OneBot",
-            from: fromLabel,
-            timestamp: Date.now(),
-            body: messageText,
-            chatType,
-            sender: { name: fromLabel, id: String(userId) },
-            envelope: envelopeOptions,
-        }) ?? { content: [{ type: "text", text: messageText }] };
+    // 自己构造带昵称的正文：OpenClaw 的 formatInboundEnvelope 在部分版本不生效，
+    // 会导致模型只看到裸文本（甚至带 CQ 码），无法区分谁说了什么。
+    // 每条消息前带 [#消息ID]，模型回复时可用 [[quote:ID]] 引用对应消息。
+    // 具体提示拼接见 inbound-prompt.ts。
+    const body = buildInboundBody({
+        cfg,
+        msg,
+        messageText,
+        fromLabel,
+        isGroup,
+        groupId,
+        sessionId,
+        historyLimit,
+        smart,
+        isAtMentioned,
+        isQuoteToBot,
+        smartReplyIntent,
+        historyMap: sessionHistories,
+        buildPendingHistoryContextFromMap,
+    });
 
-    const body = buildPendingHistoryContextFromMap
-        ? buildPendingHistoryContextFromMap({
-            historyMap: sessionHistories,
-            historyKey: sessionId,
-            limit: DEFAULT_HISTORY_LIMIT,
-            currentMessage: formattedBody,
-            formatEntry: (entry: any) =>
-                runtime.channel.reply?.formatInboundEnvelope?.({
-                    channel: "OneBot",
-                    from: fromLabel,
-                    timestamp: entry.timestamp,
-                    body: entry.body,
-                    chatType,
-                    senderLabel: entry.sender,
-                    envelope: envelopeOptions,
-                }) ?? { content: [{ type: "text", text: entry.body }] },
-        })
-        : formattedBody;
-
-    if (recordPendingHistoryEntry) {
-        recordPendingHistoryEntry({
-            historyMap: sessionHistories,
-            historyKey: sessionId,
-            entry: {
-                sender: fromLabel,
-                body: messageText,
-                timestamp: Date.now(),
-                messageId: `onebot-${Date.now()}`,
-            },
-            limit: DEFAULT_HISTORY_LIMIT,
-        });
-    }
+    rememberMessage();
 
     // 回复目标（参考 openclaw-feishu）：群聊用 group:群号，私聊用 user:用户号
     // To / OriginatingTo / ConversationLabel 均表示「发送目标」，Agent 的 message 工具会据此选择 target
     const replyTarget = isGroup ? `onebot:group:${groupId}` : `onebot:${userId}`;
-    const ctxPayload = {
-        Body: body,
-        RawBody: messageText,
-        From: isGroup ? `onebot:group:${groupId}` : `onebot:${userId}`,
-        To: replyTarget,
-        SessionKey: sessionId,
-        AccountId: config.accountId ?? "default",
-        ChatType: chatType,
-        ConversationLabel: replyTarget, // 与 Feishu 一致：表示会话/回复目标，群聊时为 group:群号，非 SenderId
-        SenderName: fromLabel,
-        SenderId: String(userId),
-        Provider: "onebot",
-        Surface: "onebot",
-        MessageSid: `onebot-${Date.now()}`,
-        Timestamp: Date.now(),
-        OriginatingChannel: "onebot",
-        OriginatingTo: replyTarget,
-        CommandAuthorized: true,
-        DeliveryContext: {
-            channel: "onebot",
-            to: replyTarget,
-            accountId: config.accountId ?? "default",
-        },
-        _onebot: { userId, groupId, isGroup },
-    };
+    const ctxPayload = buildInboundEnvelope({
+        body,
+        messageText,
+        isGroup,
+        groupId,
+        userId,
+        sessionId,
+        accountId: config.accountId ?? "default",
+        fromLabel,
+        messageId: msg.message_id,
+        mediaFacts,
+    });
 
     if (runtime.channel.session?.recordInboundSession) {
         await runtime.channel.session.recordInboundSession({
@@ -420,6 +319,8 @@ export async function processInboundMessage(api: any, msg: OneBotMessage): Promi
     let normalModeFlushTimer: ReturnType<typeof setTimeout> | null = null;
     let normalModeFlushChain: Promise<void> = Promise.resolve();
     let receivedFinal = false;
+    /** 模型在回复里用 [[quote:ID]] 指定的引用目标，由下一块实际发送时消费 */
+    let pendingQuoteId: string | undefined;
 
     const getConfig = () => getOneBotConfig(api);
 
@@ -452,9 +353,12 @@ export async function processInboundMessage(api: any, msg: OneBotMessage): Promi
         text: string,
         mediaUrl: string | undefined
     ) => {
+        // 引用只对本轮第一条真正发出的文本生效
+        const quoteTo = pendingQuoteId;
         if (text) {
-            if (effectiveIsGroup && effectiveGroupId) await sendGroupMsg(effectiveGroupId, text, getConfig);
-            else if (uid) await sendPrivateMsg(uid, text, getConfig);
+            if (effectiveIsGroup && effectiveGroupId) await sendGroupMsg(effectiveGroupId, text, getConfig, quoteTo);
+            else if (uid) await sendPrivateMsg(uid, text, getConfig, quoteTo);
+            if (quoteTo != null) pendingQuoteId = undefined;
         }
         if (mediaUrl) {
             if (effectiveIsGroup && effectiveGroupId) await sendGroupImage(effectiveGroupId, mediaUrl, api.logger, getConfig);
@@ -536,7 +440,9 @@ export async function processInboundMessage(api: any, msg: OneBotMessage): Promi
                         receivedFinal = true;
                     }
 
-                    if ((!trimmed || trimmed === "NO_REPLY" || trimmed.endsWith("NO_REPLY")) && !mediaUrl) return;
+                    // 智能触发的沉默标记：整条回复即为标记时直接丢弃，绝不发到群里
+                    const isSilentReply = smart.enabled && trimmed === smart.silentMarker;
+                    if ((!trimmed || trimmed === "NO_REPLY" || trimmed.endsWith("NO_REPLY") || isSilentReply) && !mediaUrl) return;
 
                     const { userId: uid, groupId: gid, isGroup: ig } = (ctxPayload as any)._onebot || {};
                     const sessionKey = String((ctxPayload as any).SessionKey ?? sessionId);
@@ -547,6 +453,32 @@ export async function processInboundMessage(api: any, msg: OneBotMessage): Promi
                     const usePlain = getRenderMarkdownToPlain(cfg);
                     let textPlain = usePlain ? markdownToPlain(trimmed) : trimmed;
                     if (getCollapseDoubleNewlines(cfg)) textPlain = collapseDoubleNewlines(textPlain);
+
+                    // 解析模型输出的引用标记 [[quote:消息ID]]：从正文移除，记录引用目标
+                    if (getQuoteEnabled(cfg)) {
+                        const quoteMatch = textPlain.match(/^\s*\[\[\s*quote\s*:\s*([^\]]+?)\s*\]\]\s*/i);
+                        if (quoteMatch) {
+                            const num = quoteMatch[1].match(/-?\d+/);
+                            textPlain = textPlain.slice(quoteMatch[0].length);
+                            if (num) {
+                                pendingQuoteId = num[0];
+                                traceLog.info(`quote target detected: ${pendingQuoteId}`);
+                            } else {
+                                traceLog.warn(`quote target ignored (no numeric id): ${quoteMatch[1]}`);
+                            }
+                            if (!textPlain.trim() && !mediaUrl) return;
+                        }
+                    }
+
+                    // @ 处理：[[at:QQ号]] / [CQ:at,qq=QQ号] 统一成合法 CQ 码，空号剥除；
+                    // atEnabled=false 时移除所有 at（只发文本），避免字面 CQ 码漏到群里。
+                    const atAllowed = isGroup && getAtEnabled(cfg);
+                    const atParsed = normalizeAtMarkers(textPlain);
+                    textPlain = atAllowed ? atParsed.text : atParsed.text.replace(/\[CQ:at,qq=\d+\]/g, "").trim();
+                    if (atParsed.atUserIds.length > 0) {
+                        traceLog.info(`at targets detected: ${atParsed.atUserIds.join(",")} allowed=${atAllowed}`);
+                    }
+                    if (!textPlain.trim() && !mediaUrl) return;
 
                     const shouldSendNow = longMessageMode === "normal";
 
@@ -561,11 +493,11 @@ export async function processInboundMessage(api: any, msg: OneBotMessage): Promi
 
                     // forward 模式且非最后一条：仅暂存，绝不发送，等 final 时再统一处理
                     if (longMessageMode === "forward" && info.kind !== "final") {
-                        forwardPendingSessions.set(replySessionId, Date.now());
+                        markForwardPending(replySessionId);
                         return;
                     }
                     if (info.kind === "final" && longMessageMode === "forward") {
-                        forwardPendingSessions.delete(replySessionId);
+                        clearForwardPending(replySessionId);
                     }
 
                     try {
@@ -732,7 +664,7 @@ export async function processInboundMessage(api: any, msg: OneBotMessage): Promi
                                 clearHistoryEntriesIfEnabled({
                                     historyMap: sessionHistories,
                                     historyKey: sessionId,
-                                    limit: DEFAULT_HISTORY_LIMIT,
+                                    limit: historyLimit,
                                 });
                             }
                             if (onReplySessionEnd) {
@@ -796,7 +728,7 @@ export async function processInboundMessage(api: any, msg: OneBotMessage): Promi
         setForwardSuppressDelivery(false);
         setActiveReplySelfId(null);
         lastSentChunkCountBySession.delete(replySessionId);
-        forwardPendingSessions.delete(replySessionId);
+        clearForwardPending(replySessionId);
         setActiveReplySessionId(null);
         clearActiveReplyTarget();
     }

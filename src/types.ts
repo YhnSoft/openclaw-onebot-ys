@@ -12,6 +12,12 @@ export interface OneBotMessage {
   raw_message?: string;
   self_id?: number;
   time?: number;
+  /** notice 事件类型：group_increase / notify / poke 等 */
+  notice_type?: string;
+  /** notice 子类型：notify 下的 poke（戳一戳）等 */
+  sub_type?: string;
+  /** 戳一戳事件中被戳者的 QQ 号 */
+  target_id?: number;
   sender?: {
     user_id?: number;
     nickname?: string;
