@@ -1,0 +1,3 @@
+# 测试运行产物不入库
+reports/
+.canary/
